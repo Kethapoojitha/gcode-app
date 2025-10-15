@@ -1,0 +1,613 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'dart:convert';
+import 'dart:typed_data';
+
+class MainScreen extends StatefulWidget {
+  @override
+  _MainScreenState createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> {
+  List<BluetoothDevice> devices = [];
+  BluetoothConnection? connection;
+  bool isScanning = false;
+  bool isConnected = false;
+  String status = "Checking Bluetooth...";
+  String debugInfo = "";
+  TextEditingController gCodeController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    checkBluetoothStatus();
+  }
+  void main() {
+    runApp(MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: MainScreen(),
+    ));
+  }
+  // Check Bluetooth status and permissions
+  void checkBluetoothStatus() async {
+    try {
+      // Request permissions based on Android version
+      Map<Permission, PermissionStatus> permissions = await [
+        Permission.bluetooth,
+        Permission.bluetoothConnect,
+        Permission.bluetoothScan,
+        if (Platform.isAndroid) Permission.location, // For Android < 12
+        if (Platform.isAndroid) Permission.bluetoothAdvertise, // For Android 12+
+      ].request();
+
+      // Check if all permissions are granted
+      bool allGranted = permissions.values.every((status) => status.isGranted);
+      setState(() {
+        debugInfo = "Permissions: ${permissions.toString()}";
+        if (!allGranted) {
+          status = "❌ Please grant all Bluetooth and location permissions";
+          return;
+        }
+      });
+
+      // Rest of the code remains the same
+      bool? isAvailable = await FlutterBluetoothSerial.instance.isAvailable;
+      if (isAvailable != true) {
+        setState(() {
+          status = "❌ Bluetooth not available on this device";
+        });
+        return;
+      }
+
+      bool? isEnabled = await FlutterBluetoothSerial.instance.isEnabled;
+      if (isEnabled != true) {
+        setState(() {
+          status = "❌ Bluetooth is disabled - tap to enable";
+        });
+        return;
+      }
+
+      setState(() {
+        status = "✅ Bluetooth ready - tap scan to find devices";
+      });
+    } catch (e) {
+      setState(() {
+        status = "❌ Error checking Bluetooth: $e";
+        debugInfo = "Error details: $e";
+      });
+    }
+  }
+
+  // Scan for devices
+  void scanDevices() async {
+    try {
+      // Check if Bluetooth is enabled first
+      bool? isEnabled = await FlutterBluetoothSerial.instance.isEnabled;
+      if (isEnabled != true) {
+        setState(() {
+          status = "Requesting Bluetooth enable...";
+        });
+
+        bool? result = await FlutterBluetoothSerial.instance.requestEnable();
+        if (result != true) {
+          setState(() {
+            status = "❌ Bluetooth must be enabled to scan";
+          });
+          return;
+        }
+      }
+
+      setState(() {
+        isScanning = true;
+        devices.clear();
+        status = "🔍 Scanning for devices...";
+        debugInfo = "Starting scan...";
+      });
+
+      // Get bonded devices first
+      try {
+        List<BluetoothDevice> bondedDevices = await FlutterBluetoothSerial.instance.getBondedDevices();
+        setState(() {
+          devices.addAll(bondedDevices);
+          status = "Found ${bondedDevices.length} paired devices, scanning for more...";
+          debugInfo = "Bonded devices: ${bondedDevices.map((d) => d.name).join(', ')}";
+        });
+      } catch (e) {
+        setState(() {
+          debugInfo = "Error getting bonded devices: $e";
+        });
+      }
+
+      // Start discovery
+      try {
+        var discoveryStream = FlutterBluetoothSerial.instance.startDiscovery();
+
+        discoveryStream.listen(
+                (result) {
+              setState(() {
+                if (!devices.any((device) => device.address == result.device.address)) {
+                  devices.add(result.device);
+                  debugInfo = "Found: ${result.device.name} (${result.device.address})";
+                }
+              });
+            },
+            onError: (error) {
+              setState(() {
+                isScanning = false;
+                status = "❌ Discovery error: $error";
+                debugInfo = "Discovery error details: $error";
+              });
+            },
+            onDone: () {
+              setState(() {
+                isScanning = false;
+                status = "✅ Scan complete - Found ${devices.length} devices";
+              });
+            }
+        );
+
+        // Stop after 15 seconds
+        Future.delayed(Duration(seconds: 15), () {
+          if (isScanning) {
+            FlutterBluetoothSerial.instance.cancelDiscovery();
+            setState(() { 
+              isScanning = false;
+              status = "⏰ Scan timeout - Found ${devices.length} devices";
+            });
+          }
+        });
+
+      } catch (e) {
+        setState(() {
+          isScanning = false;
+          status = "❌ Failed to start discovery: $e";
+          debugInfo = "Discovery start error: $e";
+        });
+      }
+
+    } catch (e) {
+      setState(() {
+        isScanning = false;
+        status = "❌ Scan failed: $e";
+        debugInfo = "General scan error: $e";
+      });
+    }
+  }
+
+  // Connect to device with multiple connection methods
+  void connectDevice(BluetoothDevice device) async {
+    setState(() {
+      status = "🔄 Trying to connect to ${device.name ?? device.address}...";
+      debugInfo = "Attempting connection method 1...";
+    });
+
+    // Close any existing connection first
+    if (connection != null) {
+      try {
+        await connection!.close();
+      } catch (e) {
+        print("Error closing existing connection: $e");
+      }
+      connection = null;
+    }
+
+    // Try multiple connection methods
+    bool connected = false;
+
+    // Method 1: Standard connection
+    if (!connected) {
+      try {
+        setState(() {
+          debugInfo = "Method 1: Standard connection...";
+        });
+
+        connection = await BluetoothConnection.toAddress(device.address)
+            .timeout(Duration(seconds: 8));
+        connected = true;
+      } catch (e) {
+        print("Method 1 failed: $e");
+        setState(() {
+          debugInfo = "Method 1 failed, trying method 2...";
+        });
+      }
+    }
+
+    // Method 2: Secure connection
+    if (!connected) {
+      try {
+        setState(() {
+          debugInfo = "Method 2: Secure connection...";
+        });
+
+        await Future.delayed(Duration(milliseconds: 500)); // Small delay
+        connection = await BluetoothConnection.toAddress(device.address)
+            .timeout(Duration(seconds: 6));
+        connected = true;
+      } catch (e) {
+        print("Method 2 failed: $e");
+        setState(() {
+          debugInfo = "Method 2 failed, trying method 3...";
+        });
+      }
+    }
+
+    // Method 3: With retry after delay
+    if (!connected) {
+      try {
+        setState(() {
+          debugInfo = "Method 3: Retry with delay...";
+        });
+
+        await Future.delayed(Duration(seconds: 1)); // Longer delay
+        connection = await BluetoothConnection.toAddress(device.address)
+            .timeout(Duration(seconds: 10));
+        connected = true;
+      } catch (e) {
+        print("Method 3 failed: $e");
+        setState(() {
+          debugInfo = "All connection methods failed";
+        });
+      }
+    }
+
+    if (connected && connection != null) {
+      setState(() {
+        isConnected = true;
+        status = "✅ Connected to ${device.name ?? device.address}";
+        debugInfo = "Connection successful! Ready to send G-code.";
+      });
+
+      // Listen for data with error handling
+      try {
+        connection!.input!.listen(
+                (Uint8List data) {
+              String received = ascii.decode(data);
+              print("Received: $received");
+              setState(() {
+                debugInfo = "Last received: $received";
+              });
+            },
+            onError: (error) {
+              print("Data stream error: $error");
+              setState(() {
+                debugInfo = "Data error: $error";
+              });
+            },
+            onDone: () {
+              setState(() {
+                isConnected = false;
+                status = "❌ Connection lost";
+                debugInfo = "Device disconnected";
+              });
+            }
+        );
+      } catch (e) {
+        print("Error setting up data listener: $e");
+      }
+
+    } else {
+      // All methods failed
+      setState(() {
+        status = "❌ Connection failed - all methods exhausted";
+        debugInfo = "Could not establish socket connection";
+      });
+
+      // Show simplified error dialog with solutions
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('❌ Connection Failed'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Cannot connect to: ${device.name ?? device.address}'),
+                SizedBox(height: 16),
+                Text('Quick Fixes:', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                SizedBox(height: 8),
+                _buildSolutionItem('1.', 'Go to Phone Settings → Bluetooth'),
+                _buildSolutionItem('2.', 'Find your device and UNPAIR it'),
+                _buildSolutionItem('3.', 'Turn Bluetooth OFF then ON'),
+                _buildSolutionItem('4.', 'Pair the device again (PIN: 1234 or 0000)'),
+                _buildSolutionItem('5.', 'Come back and try connecting'),
+                SizedBox(height: 12),
+                Container(
+                  padding: EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.shade100,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '💡 For Arduino HC-05/HC-06: Make sure the module LED is blinking (not solid)',
+                    style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text('OK'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                Future.delayed(Duration(milliseconds: 500), () {
+                  connectDevice(device); // Retry after dialog closes
+                });
+              },
+              child: Text('Try Again'),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  Widget _buildSolutionItem(String number, String text) {
+    return Padding(
+      padding: EdgeInsets.only(bottom: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(number, style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+          SizedBox(width: 8),
+          Expanded(child: Text(text)),
+        ],
+      ),
+    );
+  }
+
+  // Send G-code
+  void sendGCode() async {
+    if (isConnected && gCodeController.text.isNotEmpty) {
+      String gcode = gCodeController.text;
+      if (!gcode.endsWith('\n')) gcode += '\n';
+
+      connection!.output.add(utf8.encode(gcode));
+      await connection!.output.allSent;
+
+      gCodeController.clear();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('G-code sent: ${gcode.trim()}')),
+      );
+    }
+  }
+
+  // Disconnect
+  void disconnect() async {
+    await connection?.close();
+    setState(() {
+      isConnected = false;
+      status = "Disconnected";
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('G-Code Sender'),
+        backgroundColor: Colors.blue.shade700,
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: Padding(
+        padding: EdgeInsets.all(16),
+        child: Column(
+          children: [
+            // Status
+            Container(
+              width: double.infinity,
+              padding: EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: isConnected ? Colors.green.shade100 :
+                status.startsWith('❌') ? Colors.red.shade100 :
+                status.startsWith('✅') ? Colors.green.shade100 :
+                Colors.grey.shade200,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    status,
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                    textAlign: TextAlign.center,
+                  ),
+                  if (debugInfo.isNotEmpty) ...[
+                    SizedBox(height: 8),
+                    Text(
+                      debugInfo,
+                      style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            SizedBox(height: 16),
+
+            // Debug button
+            if (!isConnected && !isScanning)
+              ElevatedButton.icon(
+                onPressed: checkBluetoothStatus,
+                icon: Icon(Icons.refresh),
+                label: Text('Check Bluetooth Status'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.orange,
+                  minimumSize: Size(double.infinity, 40),
+                ),
+              ),
+
+            SizedBox(height: 8),
+
+            // Scan button or disconnect button
+            if (!isConnected)
+              ElevatedButton.icon(
+                onPressed: isScanning ? null : scanDevices,
+                icon: Icon(isScanning ? Icons.hourglass_empty : Icons.bluetooth_searching),
+                label: Text(isScanning ? 'Scanning...' : 'Scan Devices'),
+                style: ElevatedButton.styleFrom(
+                  minimumSize: Size(double.infinity, 50),
+                ),
+              )
+            else
+              ElevatedButton.icon(
+                onPressed: disconnect,
+                icon: Icon(Icons.bluetooth_disabled),
+                label: Text('Disconnect'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red,
+                  minimumSize: Size(double.infinity, 50),
+                ),
+              ),
+
+            SizedBox(height: 16),
+
+            // Device list
+            if (devices.isNotEmpty && !isConnected)
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        'Available Devices (tap to connect):',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                    Expanded(
+                      child: ListView.builder(
+                        itemCount: devices.length,
+                        itemBuilder: (context, index) {
+                          BluetoothDevice device = devices[index];
+                          bool isPaired = device.isBonded;
+
+                          return Card(
+                            margin: EdgeInsets.only(bottom: 8),
+                            child: ListTile(
+                              leading: Icon(
+                                isPaired ? Icons.bluetooth_connected : Icons.bluetooth,
+                                color: isPaired ? Colors.blue : Colors.grey,
+                              ),
+                              title: Text(device.name ?? "Unknown Device"),
+                              subtitle: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(device.address),
+                                  Text(
+                                    isPaired ? 'Paired device' : 'Available device',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: isPaired ? Colors.green : Colors.orange,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              onTap: () => connectDevice(device),
+                              tileColor: isPaired ? Colors.blue.shade50 : Colors.grey.shade50,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+            // G-code input (only when connected)
+            if (isConnected) ...[
+              TextField(
+                controller: gCodeController,
+                decoration: InputDecoration(
+                  labelText: 'Enter G-code',
+                  border: OutlineInputBorder(),
+                  hintText: 'e.g., G28, G1 X10',
+                ),
+                onSubmitted: (_) => sendGCode(),
+              ),
+              SizedBox(height: 16),
+
+              // Send button
+              ElevatedButton.icon(
+                onPressed: sendGCode,
+                icon: Icon(Icons.send),
+                label: Text('Send G-code'),
+                style: ElevatedButton.styleFrom(
+                  minimumSize: Size(double.infinity, 50),
+                  backgroundColor: Colors.green,
+                ),
+              ),
+
+              SizedBox(height: 16),
+
+              // Quick commands
+              Wrap(
+                spacing: 8,
+                children: [
+                  ElevatedButton(
+                    onPressed: () {
+                      gCodeController.text = 'G28';
+                      sendGCode();
+                    },
+                    child: Text('Home'),
+                  ),
+                  ElevatedButton(
+                    onPressed: () {
+                      gCodeController.text = 'G1 X10';
+                      sendGCode();
+                    },
+                    child: Text('X+10'),
+                  ),
+                  ElevatedButton(
+                    onPressed: () {
+                      gCodeController.text = 'G1 Y10';
+                      sendGCode();
+                    },
+                    child: Text('Y+10'),
+                  ),
+                ],
+              ),
+            ],
+
+            // Empty state when no devices found
+            if (devices.isEmpty && !isScanning && !isConnected)
+              Expanded(
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.bluetooth_disabled, size: 80, color: Colors.grey),
+                      SizedBox(height: 16),
+                      Text(
+                        'No devices found\nTap "Scan Devices" to start',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.grey.shade600),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    connection?.dispose();
+    gCodeController.dispose();
+    super.dispose();
+  }
+}
